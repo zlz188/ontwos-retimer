@@ -1,0 +1,24 @@
+schema_version = "1.0.0"
+
+id = "ontwos_retimer"
+version = "0.5.2"
+name = "On-Twos Retimer"
+tagline = "MMD physics to stepped on-twos keyframe animation"
+maintainer = "zlz <you@example.com>"
+type = "add-on"
+
+website = "https://github.com/zlz188/ontwos-retimer"
+
+# Tags must come from the official list:
+# https://docs.blender.org/manual/en/dev/advanced/extensions/tags.html
+tags = ["Animation", "Physics", "Rigging"]
+
+blender_version_min = "4.2.0"
+
+license = [
+  "SPDX:GPL-2.0-or-later",
+]
+
+copyright = [
+  "2026 zlz",
+]
