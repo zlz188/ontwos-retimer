@@ -1,30 +1,35 @@
-# On-Twos Retimer (MMD Physics Path)
+# On-Twos Retimer
 
-Convert MMD physics simulation (rigid-body cache driven bone motion) into a
-stepped **on-N** (hold every N frames) keyframe animation.
+Turn constraint / physics-driven bone animation into a stepped **on-N**
+(hold every N frames) keyframe animation, in two steps:
 
-MMD physics baking produces *point cache*, not bone keyframes — the visible
-hair/cloth motion is constraint-driven at evaluation time. This add-on closes
-the loop in two steps:
-
-1. **Bake physics → bone keyframes**: samples the constraint-evaluated pose per
-   frame and writes bone keyframes (with optional physics locking).
+1. **Bake poses → bone keyframes**: samples the constraint/physics-evaluated
+   pose per frame and writes bone keyframes (with optional locking of the
+   driving setup).
 2. **Apply on-N**: decimates keyframes (keeps frames where `(frame - phase) % N == 0`)
-   and sets constant interpolation for the "hold" look.
+   and sets constant interpolation for the classic "held frame" look.
+
+Works with **any armature** whose bones are driven by constraints or physics
+(IK, Damped Track, rigid-body simulation, cloth/hair chains, etc.). An
+optional compatibility mode restricts baking to MMD physics bones for MMD rigs.
 
 ## Features
 
-- **Physics → bone keyframes** in one operator: restores physics, samples the
-  final evaluated pose per frame, writes bone keyframes, optionally locks
-  physics (mutes rigid-track constraints + disables the rigid body world)
-- **Two-pass bake option**: keeps the damping-track look *and* a deterministic,
+- **Bake poses → bone keyframes** in one operator: restores the driving setup,
+  samples the final evaluated pose per frame, writes bone keyframes, optionally
+  locks the drivers (mutes constraints + disables the rigid body world)
+- **Target selection**: bones selected in Pose Mode (default) / MMD
+  rigid-track bones (optional compatibility mode for MMD rigs); the
+  **Include Child Chains** option grabs whole chains from a parent bone,
+  and the **Highlight Target Bones** button previews exactly which bones
+  would be baked
+- **Two-pass bake option**: keeps the soft damping look *and* a deterministic,
   re-jump-safe result
 - **Apply on-N**: decimate + constant interpolation (on-twos = 2, on-threes = 3)
 - **Stepped-modifier mode**: non-destructive stepping like doing it by hand in
-  the F-Curve editor, applied only to physics-driven bone channels
-- **MMD-aware**: auto-detects physics bones via MMD bone/rigid-body data and
-  `mmd_tools_rigid_track` constraints; dense-curve detection as a fallback for
-  non-MMD rigs
+  the F-Curve editor, applied only to target bone channels
+- **Dense-curve detection**: only processes curves that look like baked (dense)
+  animation, so hand-keyed animation is never touched
 - **Restore**: exact restore from a saved backup action (survives save/reopen),
   or a generic fallback (removes stepped modifiers / smooths constant keys)
 - All operators are undoable (Ctrl+Z); non-destructive where possible
@@ -33,8 +38,8 @@ the loop in two steps:
 ## Requirements
 
 - Blender 4.2 or newer
-- [MMD Tools](https://github.com/powroupi/blender_mmd_tools) add-on for the
-  physics baking step (optional if you already have baked physics)
+- No other add-ons required. For MMD rigs, the "MMD Rigid-Track Bones" target
+  mode needs [MMD Tools](https://github.com/powroupi/blender_mmd_tools).
 
 ## Installation
 
@@ -51,12 +56,12 @@ the loop in two steps:
 
 ## Usage
 
-1. Bake physics with MMD Tools (produces the rigid body cache).
-2. In the 3D Viewport N panel → "一拍二" tab:
-   a. Set the frame range → click **Bake physics → bone keyframes** (physics is
-      auto-restored first if it was locked);
-   b. Click **Preview stats** to confirm the affected curves → click **Apply on-N**.
-3. Not satisfied: Ctrl+Z, or **Unlock physics** and re-bake.
+1. Select an armature whose bones are driven by constraints or physics.
+2. In the 3D Viewport N panel → "On-Twos" tab:
+   a. Set the frame range and target bones → click **Bake Poses → Bone Keyframes**
+      (the driving setup is auto-restored first if it was locked);
+   b. Click **Preview Stats** to confirm the affected curves → click **Apply On-N**.
+3. Not satisfied: Ctrl+Z, or **Unlock Physics** and re-bake.
 
 ## Support
 

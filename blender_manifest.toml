@@ -1,9 +1,9 @@
 schema_version = "1.0.0"
 
 id = "ontwos_retimer"
-version = "0.5.2"
+version = "0.7.0"
 name = "On-Twos Retimer"
-tagline = "MMD physics to stepped on-twos keyframe animation"
+tagline = "Bake bone poses to keyframes, then hold every N frames"
 maintainer = "zlz <you@example.com>"
 type = "add-on"
 

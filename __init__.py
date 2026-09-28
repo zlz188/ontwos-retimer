@@ -1,53 +1,43 @@
 # -*- coding: utf-8 -*-
 """
-On-Twos Retimer (MMD Physics Path)
-============================================================
+On-Twos Retimer
+==============
 
-Background
-----------
-MMD Tools physics baking is essentially:
-    RigidBodyBake operator = bpy.ops.ptcache.bake()  -> bakes only the
-    [rigid body world cache] (point cache), producing NO bone keyframes.
+Bone motion that is driven by constraints or physics (IK, Damped Track,
+rigid-body simulation, etc.) is evaluated at playback time and produces no
+keyframes. This add-on closes the loop in two steps:
 
-The visible hair/cloth deformation chain is:
-    rigid body simulation (cache) -> bone-track empty follows ->
-    mmd_tools_rigid_track constraints (COPY_TRANSFORMS/COPY_ROTATION)
-    copy transforms in real time -> bones move -> mesh skinning deforms.
+1. Bake poses -> bone keyframes: sample the constraint-evaluated pose per
+   frame and write bone keyframes (with optional locking of the driving setup).
+2. Apply on-N: decimate keyframes (keep keys where (frame - phase) % N == 0)
+   + constant interpolation for the classic "held frame" look.
 
-In other words: bone motion is [constraint-driven], not keyframed. To make
-"on-twos" you must first do a [physics -> bone keyframes] step (evaluate the
-constraint-driven pose per frame and write bone keyframes), then do
-[decimation + constant interpolation] on top.
-
-This add-on is a two-step closed loop:
-    ① Bake physics -> bone keyframes: restore physics -> sample the post-
-      constraint pose per frame -> write bone keyframes -> (optional) lock physics
-    ② Apply on-N: decimate keyframes (keep keys where (frame-phase)%N==0)
-      + constant interpolation for a held look
+Works with any armature whose bones are driven by constraints or physics.
+An optional compatibility mode restricts baking to MMD physics bones
+(bones with 'mmd_tools_rigid_track' constraints) for MMD rigs.
 
 Notes
 -----
-- ① and ② are both UNDO-able (Ctrl+Z); ① is non-destructive (locking physics
-  can be restored: unmute constraints + enable rigid body world).
+- Step 1 and 2 are both UNDO-able (Ctrl+Z); step 1 is non-destructive
+  (locking can be restored: unmute constraints + re-enable the physics world).
 - Compatible with Blender 4.x / 5.0.
 
 Usage
 -----
-1. Bake physics with MMD Tools (get the rigid body cache);
+1. Select an armature (bones driven by constraints / physics).
 2. 3D View N panel "On-Twos" tab:
-   a. Set the range -> click [Bake physics -> bone keyframes] (physics is
-      auto-restored first if locked);
-   b. Click [Preview stats] to confirm the affected curves -> click [Apply on-N].
-3. Not satisfied: Ctrl+Z; or unlock physics (panel button) and re-bake.
+   a. Set the range and target bones -> click [Bake Poses -> Bone Keyframes];
+   b. Click [Preview Stats] to confirm the affected curves -> click [Apply On-N].
+3. Not satisfied: Ctrl+Z; or Unlock Physics (panel button) and re-bake.
 """
 
 bl_info = {
     "name": "On-Twos Retimer",
     "author": "zlz",
-    "version": (0, 5, 2),
+    "version": (0, 7, 0),
     "blender": (4, 0, 0),
     "location": "3D View > Sidebar > On-Twos",
-    "description": "Bake MMD physics into bone keyframes, then decimate + constant-hold for on-twos / on-threes stepping.",
+    "description": "Bake constraint/physics-driven bone poses into keyframes, then decimate + hold every N frames (on-twos / on-threes).",
     "category": "Animation",
     "wiki_url": "https://github.com/zlz188/ontwos-retimer",
     "tracker_url": "https://github.com/zlz188/ontwos-retimer/issues",
@@ -57,7 +47,7 @@ import math
 import re
 
 import bpy
-from bpy.props import BoolProperty, IntProperty, PointerProperty
+from bpy.props import BoolProperty, EnumProperty, IntProperty, PointerProperty
 from bpy.types import Operator, Panel, PropertyGroup
 from mathutils import Matrix
 
@@ -134,6 +124,25 @@ def _rigid_track_bones(obj):
                 names.add(pbone.name)
                 break
     return names
+
+
+def get_bone_and_descendants(armature, bone_names_set):
+    """递归获取给定骨骼集合的所有后代骨骼名称（用于『包含子链』模式）。"""
+    result = set(bone_names_set)
+    children_map = {}
+    for bone in armature.data.bones:
+        if bone.parent:
+            children_map.setdefault(bone.parent.name, set()).add(bone.name)
+
+    to_process = list(bone_names_set)
+    while to_process:
+        current = to_process.pop()
+        if current in children_map:
+            for child in children_map[current]:
+                if child not in result:
+                    result.add(child)
+                    to_process.append(child)
+    return result
 
 
 def _rot_data_path(pbone):
@@ -360,7 +369,7 @@ def _resolve_filters(context):
 def _skip_summary(skipped_bone, skipped_mmd, skipped_dense):
     parts = []
     if skipped_mmd:
-        parts.append(f"non-MMD-physics bones {skipped_mmd}")
+        parts.append(f"non-physics-detected bones {skipped_mmd}")
     if skipped_dense:
         parts.append(f"non-dense {skipped_dense}")
     if skipped_bone:
@@ -368,12 +377,18 @@ def _skip_summary(skipped_bone, skipped_mmd, skipped_dense):
     return "; ".join(parts) if parts else ""
 
 
-def _bake_target_bones(arm_obj):
-    """烘焙/步进/恢复的目标骨骼：与物理烘焙一致（默认只物理骨；勾选『烘焙全部骨骼』则全部）。"""
-    s = bpy.context.scene.ontwos
-    if s.bake_all_bones:
-        return {pb.name for pb in arm_obj.pose.bones}
-    return _rigid_track_bones(arm_obj)
+def _bake_target_bones(arm_obj, context):
+    """烘焙/步进/恢复的目标骨骼：按 target_mode 选择（默认选中骨骼，可选子链扩展；MMD 兼容模式）。"""
+    s = context.scene.ontwos
+    mode = s.target_mode
+    if mode == 'RIGID_TRACK':
+        return _rigid_track_bones(arm_obj)
+    # 'SELECTED' - 默认：姿态模式选中的骨骼；勾选『包含子链』则自动扩展到整条子链
+    bones = getattr(context, "selected_pose_bones", None)
+    names = {b.name for b in bones} if bones else set()
+    if names and s.follow_chain:
+        names = get_bone_and_descendants(arm_obj, names)
+    return names
 
 
 def _remove_baked_keys(arm_obj, bone_names, start, end):
@@ -399,7 +414,7 @@ def _remove_baked_keys(arm_obj, bone_names, start, end):
 
 
 def _stepped_fcurves(context):
-    """步进插值模式下要处理的目标：只取目标骨骼（物理烘焙骨）的通道，避免误伤躯干等手K骨骼。"""
+    """步进插值模式下要处理的目标：只取目标骨骼的通道，避免误伤躯干等手K骨骼。"""
     out = []
     selected_pose = None
     if context.scene.ontwos.only_selected_bones:
@@ -412,7 +427,7 @@ def _stepped_fcurves(context):
         adata = obj.animation_data
         if not adata or not adata.action:
             continue
-        target = _bake_target_bones(obj)
+        target = _bake_target_bones(obj, context)
         if not target:
             continue
         for fc in adata.action.fcurves:
@@ -465,21 +480,29 @@ class ONTWOS_Settings(PropertyGroup):
     frame_start: IntProperty(name="Start Frame", default=0)
     frame_end: IntProperty(name="End Frame", default=250)
 
-    bake_all_bones: BoolProperty(
-        name="Bake All Bones",
+    target_mode: EnumProperty(
+        name="Target Bones",
+        items=[
+            ('SELECTED', "Selected Bones", "Only bake the bones selected in Pose Mode (default)"),
+            ('RIGID_TRACK', "MMD Rigid-Track Bones", "Only bake bones with 'mmd_tools_rigid_track' constraints (MMD rigs, requires MMD Tools)"),
+        ],
+        default='SELECTED',
+    )
+    follow_chain: BoolProperty(
+        name="Include Child Chains",
         default=False,
-        description="By default only physics bones (with mmd_tools_rigid_track constraints) are baked; enable to bake all armature bones",
+        description="When enabled, selecting a parent bone in Pose Mode automatically includes its entire child chain (e.g. select the hip to grab the whole leg chain)",
     )
     bake_mute_physics: BoolProperty(
-        name="Lock after Bake (damping baked in)",
+        name="Lock after Bake (drivers baked in)",
         default=True,
         description="After baking, mute all constraints on baked bones and disable the rigid body world for a deterministic, re-jump-safe pure keyframe animation; "
-                    "damping is already sampled into the keyframes, no active constraints needed (unlock and re-bake anytime)",
+                    "the driven motion is already sampled into the keyframes, no active constraints needed (unlock and re-bake anytime)",
     )
     bake_keep_damping: BoolProperty(
         name="Keep Damping as Active Constraint (non-deterministic)",
         default=False,
-        description="Default off: damping is baked into keyframes, pose is deterministic and jumping back resets. On: adds another active damping layer on top of "
+        description="Default off: driven motion is baked into keyframes, pose is deterministic and jumping back resets. On: adds another active damping layer on top of "
                     "the keyframes (softer / bigger swing, but playback, pause and re-jump are not deterministic and may not return to the start)",
     )
     bake_mute_all: BoolProperty(
@@ -490,20 +513,21 @@ class ONTWOS_Settings(PropertyGroup):
     bake_two_pass: BoolProperty(
         name="Two-Pass Bake (damping look + deterministic)",
         default=False,
-        description="Two-pass bake: ① write 'physics + damping' into keyframes and mute rigid constraints; ② with the rigid body world off, sample and fix "
-                    "the 'keyframes + active damping' display pose into keyframes, then fully lock. Keeps the damping look while staying deterministic and "
+        description="Two-pass bake: ① write 'driven motion + damping' into keyframes and mute rigid constraints; ② with the rigid body world off, sample and fix "
+                    "the 'keyframes + active damping' display pose into keyframes, then fully lock. Keeps the soft look while staying deterministic and "
                     "re-jump-safe (more stable than keeping active damping; divergent frames are clamped and reported)",
     )
 
     use_mmd_physics: BoolProperty(
-        name="Detect MMD Physics Bones (auto)",
-        default=True,
-        description="When the armature has MMD data, locate physics-driven bones via MMD rigid-body/bone types and only process those curves",
+        name="MMD Physics Detection",
+        default=False,
+        description="When enabled, only process curves of bones detected as MMD physics-driven (requires MMD data on the armature / MMD Tools). "
+                    "Disabled by default so the tool works on any rig",
     )
     only_dense: BoolProperty(
         name="Dense Baked Curves Only",
         default=True,
-        description="Used when MMD detection is unavailable: judge density by the curve's own covered range to avoid deleting hand-keyed animation",
+        description="Only process curves that look like baked (dense) animation, judged by the curve's own covered range, to avoid touching hand-keyed animation",
     )
     only_selected_bones: BoolProperty(
         name="Selected Bones Only",
@@ -561,7 +585,7 @@ def _bake_pose_to_keys(context, arm_obj, bone_names, start, end):
 
 
 def _sample_display(context, arm_obj, bone_names, start, end):
-    """第2遍采样：在『关键帧+活动阻尼』（刚体世界已关、目标冻结）下逐帧采样最终显示姿态。
+    """第2遍采样：在『关键帧+活动阻尼』（物理世界已关、目标冻结）下逐帧采样最终显示姿态。
     非有限值钳制为上一有效帧姿态。返回 (frames, total_clamped)。"""
     ordered = _parent_first(arm_obj, bone_names)
     prev_active = context.view_layer.objects.active
@@ -623,8 +647,8 @@ def _set_constraint_mutes(arm_obj, bone_names, mute_all_except=None, mute_names=
 
 class ONTWOS_OT_bake_physics(Operator):
     bl_idname = "ontwos.bake_physics"
-    bl_label = "Bake Physics → Bone Keyframes"
-    bl_description = "Write the MMD physics (rigid body cache driven bone motion) pose per frame into bone keyframes, producing dense keyframes ready for decimation (Ctrl+Z undoable)"
+    bl_label = "Bake Poses → Bone Keyframes"
+    bl_description = "Write the constraint/physics-evaluated bone pose per frame into bone keyframes, producing dense keyframes ready for decimation (Ctrl+Z undoable)"
     bl_options = {'REGISTER', 'UNDO'}
 
     @classmethod
@@ -639,7 +663,7 @@ class ONTWOS_OT_bake_physics(Operator):
 
         armatures = [o for o in context.selected_objects if o.type == 'ARMATURE']
         if not armatures:
-            self.report({'WARNING'}, "Select an armature object first (with MMD physics bones)")
+            self.report({'WARNING'}, "Select an armature object first")
             return {'CANCELLED'}
 
         rbw = context.scene.rigidbody_world
@@ -647,34 +671,30 @@ class ONTWOS_OT_bake_physics(Operator):
         total_clamped = 0
 
         for arm_obj in armatures:
-            # 1) 确定目标骨骼
-            if s.bake_all_bones:
-                bone_names = {pb.name for pb in arm_obj.pose.bones}
-            else:
-                bone_names = _rigid_track_bones(arm_obj)
-                if not bone_names:
-                    self.report(
-                        {'WARNING'},
-                        f"{arm_obj.name}: no bones with mmd_tools_rigid_track constraints found. "
-                        "If this is a physics model, enable 'Bake All Bones'",
-                    )
-                    continue
+            # 1) 确定目标骨骼（按 target_mode，默认全部骨骼）
+            bone_names = _bake_target_bones(arm_obj, context)
+            if not bone_names:
+                self.report(
+                    {'WARNING'},
+                    f"{arm_obj.name}: no bones matched the target. Select bones in Pose Mode or change 'Target Bones'",
+                )
+                continue
 
             # 2) 确保有动画数据/动作
             adata = arm_obj.animation_data_create()
             if adata.action is None:
-                adata.action = bpy.data.actions.new(name=f"{arm_obj.name}_physics_bake")
+                adata.action = bpy.data.actions.new(name=f"{arm_obj.name}_pose_bake")
 
-            # 3) 先恢复物理（解除全部约束静默 + 启用刚体世界），保证采到的是物理姿态
+            # 3) 先恢复驱动（解除全部约束静默 + 启用物理世界），保证采到的是驱动后的姿态
             _set_constraint_mutes(arm_obj, bone_names, mute_names=set())
             if rbw is not None:
                 rbw.enabled = True
 
             if s.bake_two_pass:
                 # ---------- 两遍烘焙：保留阻尼观感 + 确定锁定 ----------
-                # 第1遍：物理+阻尼 → 关键帧（显式basis，防拉抻）
+                # 第1遍：驱动+阻尼 → 关键帧（显式basis，防拉抻）
                 total_clamped += _bake_pose_to_keys(context, arm_obj, bone_names, start, end)
-                # 只静默刚体约束，保留阻尼活动；关闭刚体世界（冻结阻尼目标 → 确定、防发散）
+                # 只静默刚体跟踪类约束，保留阻尼活动；关闭物理世界（冻结目标 → 确定、防发散）
                 _set_constraint_mutes(arm_obj, bone_names, mute_names={"mmd_tools_rigid_track"})
                 if rbw is not None:
                     rbw.enabled = False
@@ -688,7 +708,7 @@ class ONTWOS_OT_bake_physics(Operator):
                 # ---------- 默认：单遍烘焙 ----------
                 total_clamped += _bake_pose_to_keys(context, arm_obj, bone_names, start, end)
                 # 锁定（可选）：默认静默全部约束（阻尼已烘焙进关键帧，姿态确定可回跳）；
-                #    仅当显式勾选『保留阻尼追踪为活动约束』时才只静默刚体约束（非确定行为）
+                #    仅当显式勾选『保留阻尼为活动约束』时才只静默刚体跟踪约束（非确定行为）
                 if s.bake_mute_all or s.bake_mute_physics:
                     if s.bake_mute_all or not s.bake_keep_damping:
                         _set_constraint_mutes(arm_obj, bone_names, mute_all_except=set())
@@ -704,14 +724,14 @@ class ONTWOS_OT_bake_physics(Operator):
             return {'CANCELLED'}
 
         if s.bake_two_pass:
-            msg = f"Two-pass bake and full lock: frames {start}~{end}, {total_bones} bones (damping look kept, deterministic and re-jump-safe)"
+            msg = f"Two-pass bake and full lock: frames {start}~{end}, {total_bones} bones (soft look kept, deterministic and re-jump-safe)"
         else:
-            msg = f"Baked physics pose to keyframes: frames {start}~{end}, {total_bones} bones"
+            msg = f"Baked poses to keyframes: frames {start}~{end}, {total_bones} bones"
             if s.bake_mute_physics:
                 if s.bake_mute_all or not s.bake_keep_damping:
                     msg += " (fully locked incl. damping, deterministic and re-jump-safe)"
                 else:
-                    msg += " (physics locked, active damping kept - non-deterministic)"
+                    msg += " (drivers locked, active damping kept - non-deterministic)"
         if total_clamped:
             msg += f"; {total_clamped} divergent evaluations clamped to the previous pose"
             self.report({'WARNING'}, msg)
@@ -723,7 +743,7 @@ class ONTWOS_OT_bake_physics(Operator):
 class ONTWOS_OT_unlock_physics(Operator):
     bl_idname = "ontwos.unlock_physics"
     bl_label = "Unlock Physics"
-    bl_description = "Unmute all muted constraints on the selected armatures and re-enable the rigid body world, removing baked bone keyframes to fully return to physics-driven motion (Ctrl+Z undoable)"
+    bl_description = "Unmute all muted constraints on the selected armatures and re-enable the rigid body world, removing baked bone keyframes to fully return to driven motion (Ctrl+Z undoable)"
     bl_options = {'REGISTER', 'UNDO'}
 
     @classmethod
@@ -744,7 +764,7 @@ class ONTWOS_OT_unlock_physics(Operator):
                     if constr.mute:
                         constr.mute = False
                         n += 1
-            bone_names = _bake_target_bones(obj)
+            bone_names = _bake_target_bones(obj, context)
             if bone_names:
                 keys += _remove_baked_keys(obj, bone_names, start, end)
         if rbw is not None:
@@ -753,6 +773,55 @@ class ONTWOS_OT_unlock_physics(Operator):
         if keys:
             msg += f", removed {keys} baked keyframes"
         self.report({'INFO'}, msg)
+        return {'FINISHED'}
+
+
+class ONTWOS_OT_preview_target(Operator):
+    bl_idname = "ontwos.preview_target"
+    bl_label = "Highlight Target Bones"
+    bl_description = "Select (highlight) in Pose Mode the bones the current target setting would affect, without modifying anything"
+
+    @classmethod
+    def poll(cls, context):
+        return bool(context.selected_objects)
+
+    def execute(self, context):
+        arm_obj = context.active_object
+        if arm_obj is None or arm_obj.type != 'ARMATURE':
+            armatures = [o for o in context.selected_objects if o.type == 'ARMATURE']
+            if not armatures:
+                self.report({'WARNING'}, "Select an armature object first")
+                return {'CANCELLED'}
+            arm_obj = armatures[0]
+
+        bone_names = _bake_target_bones(arm_obj, context)
+        if not bone_names:
+            self.report(
+                {'WARNING'},
+                "No bones matched the target: select bones in Pose Mode (or enable 'Include Child Chains' to grab whole chains) "
+                "or switch 'Target Bones' to 'MMD Rigid-Track Bones'",
+            )
+            return {'CANCELLED'}
+
+        current_mode = context.mode
+        try:
+            if current_mode != 'POSE':
+                bpy.ops.object.mode_set(mode='POSE')
+            bpy.ops.pose.select_all(action='DESELECT')
+            for pb in arm_obj.pose.bones:
+                # Blender 5.0 起选择状态存放在 PoseBone.select；旧版本（4.x 及更早）存放在 Bone.select，需兼容处理
+                if hasattr(pb, 'select'):
+                    pb.select = pb.name in bone_names
+                else:
+                    pb.bone.select = pb.name in bone_names
+        finally:
+            if current_mode != 'POSE':
+                bpy.ops.object.mode_set(mode=current_mode)
+
+        self.report(
+            {'INFO'},
+            f"Highlighted {len(bone_names)} target bone(s) in Pose Mode (nothing modified)",
+        )
         return {'FINISHED'}
 
 
@@ -799,7 +868,7 @@ class ONTWOS_OT_preview(Operator):
 class ONTWOS_OT_apply(Operator):
     bl_idname = "ontwos.apply"
     bl_label = "Apply On-N (decimate + hold)"
-    bl_description = "Decimate the physics-baked keyframes of the selected objects/bones and set constant interpolation for the on-N hold (Ctrl+Z undoable)"
+    bl_description = "Decimate the baked keyframes of the selected objects/bones and set constant interpolation for the on-N hold (Ctrl+Z undoable)"
     bl_options = {'REGISTER', 'UNDO'}
 
     @classmethod
@@ -844,7 +913,7 @@ class ONTWOS_OT_apply(Operator):
             self.report(
                 {'WARNING'},
                 "No processable curves matched (check: armature selected, range correct, "
-                + ("MMD physics bone detection working" if s.use_mmd_physics else "'Dense Only' switch")
+                + ("MMD physics detection enabled" if s.use_mmd_physics else "'Dense Baked Curves Only' switch")
                 + (f"; skipped: {skipped}" if skipped else "") + ")",
             )
             return {'CANCELLED'}
@@ -863,7 +932,7 @@ class ONTWOS_OT_remove_onetwos(Operator):
     bl_description = (
         "Remove the applied on-N effect: first tries exact restore from the backup taken before 'Apply On-N' "
         "(backup is saved with the file and survives restarts); without a backup, falls back to a generic "
-        "method - remove stepped modifiers and smooth constant keys in range (physics-baked bones only, never hand-keyed bones)."
+        "method - remove stepped modifiers and smooth constant keys in range (target bones only, never hand-keyed bones)."
     )
     bl_options = {'REGISTER', 'UNDO'}
 
@@ -940,7 +1009,7 @@ class ONTWOS_OT_set_range(Operator):
 # ---------------------------------------------------------------------------
 
 class ONTWOS_PT_panel(Panel):
-    bl_label = "On-Twos Retimer (MMD Path)"
+    bl_label = "On-Twos Retimer"
     bl_idname = "ONTWOS_PT_panel"
     bl_space_type = 'VIEW_3D'
     bl_region_type = 'UI'
@@ -958,11 +1027,13 @@ class ONTWOS_PT_panel(Panel):
         row.prop(s, "frame_end")
         col.operator("ontwos.set_range", icon="VIEWZOOM")
 
-        # 第一步：物理→骨骼关键帧
+        # 第一步：驱动姿态 → 骨骼关键帧
         box = layout.box()
         col = box.column(align=True)
-        col.label(text="Step 1 · Physics → Bone Keyframes", icon="PHYSICS")
-        col.prop(s, "bake_all_bones")
+        col.label(text="Step 1 · Bake Poses → Bone Keyframes", icon="KEYFRAME_HLT")
+        col.prop(s, "target_mode")
+        col.prop(s, "follow_chain")
+        col.operator("ontwos.preview_target", icon="RESTRICT_SELECT_OFF")
         col.prop(s, "bake_two_pass")
         col.prop(s, "bake_mute_physics")
         col.prop(s, "bake_keep_damping")
@@ -971,11 +1042,14 @@ class ONTWOS_PT_panel(Panel):
         col.operator("ontwos.unlock_physics", icon="LOOP_BACK")
         tip = box.column(align=True)
         tip.scale_y = 0.85
-        tip.label(text="Tip: 'Two-Pass Bake' keeps the damping-track look and stays", icon="INFO")
+        tip.label(text="Tip: 'Two-Pass Bake' keeps the soft damping look and stays", icon="INFO")
         tip.label(text="deterministic (recommended, no jump-back reset issue); the")
-        tip.label(text="default bake writes physics + damping into keyframes and fully")
-        tip.label(text="locks; tick 'Keep Damping' only for an extra active damping")
-        tip.label(text="layer (non-deterministic).")
+        tip.label(text="default bake writes driven motion + damping into keyframes")
+        tip.label(text="and fully locks; tick 'Keep Damping' only for an extra active")
+        tip.label(text="damping layer (non-deterministic). 'Include Child Chains'")
+        tip.label(text="grabs whole chains from a parent bone; the highlight button")
+        tip.label(text="shows exactly which bones would be baked. 'MMD Rigid-Track")
+        tip.label(text="Bones' is for MMD rigs (needs MMD Tools).")
 
         # 第二步：一拍N抽稀
         box = layout.box()
@@ -995,15 +1069,15 @@ class ONTWOS_PT_panel(Panel):
         tip.label(text="Tip: 'Remove On-N' removes the applied effect: exact restore from", icon="INFO")
         tip.label(text="backup when available (backup saves with the file and survives")
         tip.label(text="restarts); otherwise generic removal - remove stepped modifiers,")
-        tip.label(text="smooth constant keys, physics-baked bones only. 'Stepped Mode'")
+        tip.label(text="smooth constant keys, target bones only. 'Stepped Mode'")
         tip.label(text="matches doing it by hand (select all channels -> stepped -> size N)")
-        tip.label(text="and only touches physics-baked bones (never hand-keyed ones).")
+        tip.label(text="and only touches target bones (never hand-keyed ones).")
 
         layout.separator()
         info = layout.box()
         info_col = info.column(align=True)
         info_col.scale_y = 0.85
-        info_col.label(text="Flow: MMD bake physics (cache) -> 1. physics -> keyframes", icon="INFO")
+        info_col.label(text="Flow: select armature -> 1. bake poses -> keyframes", icon="INFO")
         info_col.label(text="-> 2. apply on-N. Mistakes: Ctrl+Z; to redo step 1,")
         info_col.label(text="'Unlock Physics' first, then re-bake.")
 
@@ -1017,6 +1091,7 @@ classes = (
     ONTWOS_OT_set_range,
     ONTWOS_OT_bake_physics,
     ONTWOS_OT_unlock_physics,
+    ONTWOS_OT_preview_target,
     ONTWOS_OT_preview,
     ONTWOS_OT_apply,
     ONTWOS_OT_remove_onetwos,
