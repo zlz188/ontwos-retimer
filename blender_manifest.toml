@@ -2,8 +2,8 @@ schema_version = "1.0.0"
 
 id = "ontwos_retimer"
 version = "0.7.0"
-name = "On-Twos Retimer"
-tagline = "Bake bone poses to keyframes, then hold every N frames"
+name = "On-Twos 一拍二重定时（中文版）"
+tagline = "把约束/物理驱动的骨骼姿态烘焙成关键帧，再抽稀实现一拍N定格"
 maintainer = "zlz <you@example.com>"
 type = "add-on"
 
