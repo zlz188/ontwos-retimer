@@ -1,39 +1,43 @@
 # -*- coding: utf-8 -*-
 """
-On-Twos 一拍二重定时插件（通用版）
-=================================
+On-Twos Retimer
+==============
 
-被【约束/物理】驱动的骨骼运动（IK、阻尼追踪、刚体模拟、布料/头发链条等）在播放时
-实时求值，并不产生关键帧。本插件两步闭环：
+Bone motion that is driven by constraints or physics (IK, Damped Track,
+rigid-body simulation, etc.) is evaluated at playback time and produces no
+keyframes. This add-on closes the loop in two steps:
 
-    ① 烘焙姿态→骨骼关键帧：逐帧采样『约束求值后』的最终姿态并写入骨骼关键帧
-      （可选锁定驱动设置）
-    ② 应用一拍N：对关键帧抽稀(保留满足 (帧-相位)%N==0 的 key)+恒定插值，实现定格效果
+1. Bake poses -> bone keyframes: sample the constraint-evaluated pose per
+   frame and write bone keyframes (with optional locking of the driving setup).
+2. Apply on-N: decimate keyframes (keep keys where (frame - phase) % N == 0)
+   + constant interpolation for the classic "held frame" look.
 
-适用于任何『骨骼被约束/物理驱动』的骨架。可选兼容模式可把烘焙限制到 MMD 物理骨
-（带 mmd_tools_rigid_track 约束的骨骼），用于 MMD 模型。
+Works with any armature whose bones are driven by constraints or physics.
+An optional compatibility mode restricts baking to MMD physics bones
+(bones with 'mmd_tools_rigid_track' constraints) for MMD rigs.
 
-其他说明
---------
-- ①②均带 UNDO，可 Ctrl+Z 撤销；①非破坏（锁定可恢复：解除约束静默+启用物理世界）。
-- 兼容 Blender 4.x / 5.0。
+Notes
+-----
+- Step 1 and 2 are both UNDO-able (Ctrl+Z); step 1 is non-destructive
+  (locking can be restored: unmute constraints + re-enable the physics world).
+- Compatible with Blender 4.x / 5.0.
 
-用法
-----
-1. 选中骨架（骨骼被约束/物理驱动）；
-2. 3D 视图右侧 N 面板「一拍二」标签页：
-   a. 设好范围与目标骨骼 → 点【烘焙姿态→骨骼关键帧】；
-   b. 点【预览统计】确认影响范围 → 点【应用一拍N】。
-3. 效果不满意：Ctrl+Z；或解锁（面板按钮）重新烘焙。
+Usage
+-----
+1. Select an armature (bones driven by constraints / physics).
+2. 3D View N panel "On-Twos" tab:
+   a. Set the range and target bones -> click [Bake Poses -> Bone Keyframes];
+   b. Click [Preview Stats] to confirm the affected curves -> click [Apply On-N].
+3. Not satisfied: Ctrl+Z; or Unlock Physics (panel button) and re-bake.
 """
 
 bl_info = {
-    "name": "On-Twos 一拍二重定时（通用版）",
+    "name": "On-Twos Retimer",
     "author": "zlz",
     "version": (0, 7, 0),
     "blender": (4, 0, 0),
-    "location": "3D 视图 > 侧边栏 > 一拍二",
-    "description": "把约束/物理驱动的骨骼姿态烘焙成关键帧，再抽稀+恒定插值实现一拍N定格效果（一拍二/一拍三）。",
+    "location": "3D View > Sidebar > On-Twos",
+    "description": "Bake constraint/physics-driven bone poses into keyframes, then decimate + hold every N frames (on-twos / on-threes).",
     "category": "Animation",
     "wiki_url": "https://github.com/zlz188/ontwos-retimer",
     "tracker_url": "https://github.com/zlz188/ontwos-retimer/issues",
@@ -365,12 +369,12 @@ def _resolve_filters(context):
 def _skip_summary(skipped_bone, skipped_mmd, skipped_dense):
     parts = []
     if skipped_mmd:
-        parts.append(f"非物理识别骨 {skipped_mmd}")
+        parts.append(f"non-physics-detected bones {skipped_mmd}")
     if skipped_dense:
-        parts.append(f"非密集 {skipped_dense}")
+        parts.append(f"non-dense {skipped_dense}")
     if skipped_bone:
-        parts.append(f"非选中骨 {skipped_bone}")
-    return "；".join(parts) if parts else ""
+        parts.append(f"unselected bones {skipped_bone}")
+    return "; ".join(parts) if parts else ""
 
 
 def _bake_target_bones(arm_obj, context):
@@ -460,82 +464,82 @@ def _apply_stepped(context, s, step, phase, start, end):
 
 class ONTWOS_Settings(PropertyGroup):
     step: IntProperty(
-        name="一拍 N",
+        name="On-N",
         default=2,
         min=1,
         max=12,
-        description="每 N 帧保持一个姿势（一拍二=2，一拍三=3）",
+        description="Hold a pose every N frames (on-twos=2, on-threes=3)",
     )
     phase: IntProperty(
-        name="相位偏移",
+        name="Phase Offset",
         default=0,
         min=0,
         max=11,
-        description="步进网格相位（通常 0；与角色主体一拍网格错开时调整，实际按 N 取模）",
+        description="Stepping grid phase (usually 0; adjust to offset from the character's main on-N grid, taken modulo N)",
     )
-    frame_start: IntProperty(name="起始帧", default=0)
-    frame_end: IntProperty(name="结束帧", default=250)
+    frame_start: IntProperty(name="Start Frame", default=0)
+    frame_end: IntProperty(name="End Frame", default=250)
 
     target_mode: EnumProperty(
-        name="目标骨骼",
+        name="Target Bones",
         items=[
-            ('SELECTED', "选中骨骼", "只烘焙姿态模式下选中的骨骼（默认）"),
-            ('RIGID_TRACK', "MMD 刚体跟踪骨", "只烘焙带 mmd_tools_rigid_track 约束的骨骼（MMD 模型，需 MMD Tools）"),
+            ('SELECTED', "Selected Bones", "Only bake the bones selected in Pose Mode (default)"),
+            ('RIGID_TRACK', "MMD Rigid-Track Bones", "Only bake bones with 'mmd_tools_rigid_track' constraints (MMD rigs, requires MMD Tools)"),
         ],
         default='SELECTED',
     )
     follow_chain: BoolProperty(
-        name="包含子链",
+        name="Include Child Chains",
         default=False,
-        description="勾选后，姿态模式下选中父级骨骼会自动包含整条子链（如选中骨盆即可覆盖整条腿链）",
+        description="When enabled, selecting a parent bone in Pose Mode automatically includes its entire child chain (e.g. select the hip to grab the whole leg chain)",
     )
     bake_mute_physics: BoolProperty(
-        name="烘焙后锁定（驱动已含在关键帧）",
+        name="Lock after Bake (drivers baked in)",
         default=True,
-        description="烘焙完成后静默烘焙骨上的全部约束并关闭物理世界，得到确定、可回跳的纯关键帧动画；"
-                    "驱动效果已在采样时写入关键帧，无需保留活动约束（可随时恢复重新烘焙）",
+        description="After baking, mute all constraints on baked bones and disable the rigid body world for a deterministic, re-jump-safe pure keyframe animation; "
+                    "the driven motion is already sampled into the keyframes, no active constraints needed (unlock and re-bake anytime)",
     )
     bake_keep_damping: BoolProperty(
-        name="同时保留阻尼为活动约束（非确定）",
+        name="Keep Damping as Active Constraint (non-deterministic)",
         default=False,
-        description="默认关闭：驱动已烘焙进关键帧，姿态确定、跳回开头会重置。打开则以活动约束形式在关键帧上再叠加一层"
-                    "阻尼（更柔顺/摆幅更大，但播放、暂停、回跳不具确定性，可能出现不回到开头的情况）",
+        description="Default off: driven motion is baked into keyframes, pose is deterministic and jumping back resets. On: adds another active damping layer on top of "
+                    "the keyframes (softer / bigger swing, but playback, pause and re-jump are not deterministic and may not return to the start)",
     )
     bake_mute_all: BoolProperty(
-        name="完全冻结（静默所有约束）",
+        name="Freeze All (mute all constraints)",
         default=False,
-        description="强制静默烘焙骨上的全部约束（与默认锁定位相同，仅作显式确认）；适合需要纯净、可预测的一拍N定格",
+        description="Force-mute all constraints on baked bones (same lock as the default, explicit confirmation); for a clean, predictable on-N hold",
     )
     bake_two_pass: BoolProperty(
-        name="两遍烘焙（保留阻尼观感+确定）",
+        name="Two-Pass Bake (damping look + deterministic)",
         default=False,
-        description="两遍烘焙：①把『驱动+阻尼』写入关键帧并静默刚体跟踪约束；②关闭物理世界后把『关键帧+活动阻尼』的"
-                    "显示姿态采样固化进关键帧，随后完全锁定。既保留阻尼的柔顺/摆幅观感，又是确定、可回跳的"
-                    "纯关键帧（比『保留活动阻尼』更稳，无跳回不重置问题；个别帧求值发散会自动钳制并提示）",
+        description="Two-pass bake: ① write 'driven motion + damping' into keyframes and mute rigid constraints; ② with the rigid body world off, sample and fix "
+                    "the 'keyframes + active damping' display pose into keyframes, then fully lock. Keeps the soft look while staying deterministic and "
+                    "re-jump-safe (more stable than keeping active damping; divergent frames are clamped and reported)",
     )
 
     use_mmd_physics: BoolProperty(
-        name="MMD 物理骨识别",
+        name="MMD Physics Detection",
         default=False,
-        description="启用后只处理被识别为 MMD 物理驱动的骨骼曲线（骨架需带 MMD 数据 / MMD Tools）。"
-                    "默认关闭，保证插件在任意骨架上都能用",
+        description="When enabled, only process curves of bones detected as MMD physics-driven (requires MMD data on the armature / MMD Tools). "
+                    "Disabled by default so the tool works on any rig",
     )
     only_dense: BoolProperty(
-        name="只处理密集烘焙曲线",
+        name="Dense Baked Curves Only",
         default=True,
-        description="按曲线自身覆盖范围密度判断是否为烘焙（密集）动画，避免误删手 K 动画",
+        description="Only process curves that look like baked (dense) animation, judged by the curve's own covered range, to avoid touching hand-keyed animation",
     )
     only_selected_bones: BoolProperty(
-        name="仅处理选中骨骼",
+        name="Selected Bones Only",
         default=False,
-        description="姿态模式下只处理当前选中的骨骼曲线",
+        description="In Pose Mode, only process curves of the currently selected bones",
     )
     use_stepped: BoolProperty(
-        name="步进插值模式（同曲线编辑器手动）",
+        name="Stepped Mode (like F-Curve editor)",
         default=False,
-        description="用步进F曲线修改器(step_size=N)对目标骨骼通道做一拍N定格，与你手动"
-                    "『全选所有通道→步进插值→步长尺寸』一致；不受密集/物理骨筛选限制，所有目标通道统一步进，"
-                    "非破坏性（可删修改器还原）",
+        description="Use a stepped F-modifier (step size = N) on all target bone channels for on-N holds, matching what you would do by hand with "
+                    "'select all channels -> Stepped interpolation -> step size'; not limited by dense/physics filters, all channels step together, "
+                    "non-destructive (remove the modifier to restore)",
     )
 
 
@@ -643,8 +647,8 @@ def _set_constraint_mutes(arm_obj, bone_names, mute_all_except=None, mute_names=
 
 class ONTWOS_OT_bake_physics(Operator):
     bl_idname = "ontwos.bake_physics"
-    bl_label = "烘焙姿态→骨骼关键帧"
-    bl_description = "把约束/物理求值后的骨骼姿态逐帧写入骨骼关键帧，得到可抽稀的密集关键帧（可 Ctrl+Z 撤销）"
+    bl_label = "Bake Poses → Bone Keyframes"
+    bl_description = "Write the constraint/physics-evaluated bone pose per frame into bone keyframes, producing dense keyframes ready for decimation (Ctrl+Z undoable)"
     bl_options = {'REGISTER', 'UNDO'}
 
     @classmethod
@@ -659,7 +663,7 @@ class ONTWOS_OT_bake_physics(Operator):
 
         armatures = [o for o in context.selected_objects if o.type == 'ARMATURE']
         if not armatures:
-            self.report({'WARNING'}, "请先选中骨架对象")
+            self.report({'WARNING'}, "Select an armature object first")
             return {'CANCELLED'}
 
         rbw = context.scene.rigidbody_world
@@ -672,7 +676,7 @@ class ONTWOS_OT_bake_physics(Operator):
             if not bone_names:
                 self.report(
                     {'WARNING'},
-                    f"{arm_obj.name} 没有匹配到目标骨骼：请在姿态模式下选中骨骼，或修改『目标骨骼』选项",
+                    f"{arm_obj.name}: no bones matched the target. Select bones in Pose Mode or change 'Target Bones'",
                 )
                 continue
 
@@ -716,20 +720,20 @@ class ONTWOS_OT_bake_physics(Operator):
             total_bones += len(bone_names)
 
         if total_bones == 0:
-            self.report({'WARNING'}, "没有可烘焙的骨骼")
+            self.report({'WARNING'}, "No bones to bake")
             return {'CANCELLED'}
 
         if s.bake_two_pass:
-            msg = f"两遍烘焙并完全锁定：{start}~{end} 帧、{total_bones} 个骨骼（保留阻尼观感，姿态确定可回跳）"
+            msg = f"Two-pass bake and full lock: frames {start}~{end}, {total_bones} bones (soft look kept, deterministic and re-jump-safe)"
         else:
-            msg = f"已把驱动姿态烘焙为关键帧：{start}~{end} 帧、{total_bones} 个骨骼"
+            msg = f"Baked poses to keyframes: frames {start}~{end}, {total_bones} bones"
             if s.bake_mute_physics:
                 if s.bake_mute_all or not s.bake_keep_damping:
-                    msg += "，已完全锁定（含阻尼，姿态确定可回跳）"
+                    msg += " (fully locked incl. damping, deterministic and re-jump-safe)"
                 else:
-                    msg += "，驱动已锁定但保留活动阻尼（非确定）"
+                    msg += " (drivers locked, active damping kept - non-deterministic)"
         if total_clamped:
-            msg += f"；{total_clamped} 处求值发散已按上一姿态钳制"
+            msg += f"; {total_clamped} divergent evaluations clamped to the previous pose"
             self.report({'WARNING'}, msg)
         else:
             self.report({'INFO'}, msg)
@@ -738,8 +742,8 @@ class ONTWOS_OT_bake_physics(Operator):
 
 class ONTWOS_OT_unlock_physics(Operator):
     bl_idname = "ontwos.unlock_physics"
-    bl_label = "恢复驱动（解锁）"
-    bl_description = "解除选中骨架骨骼上被静默的全部约束并重新启用物理世界，同时清除烘焙生成的骨骼关键帧，完全回到驱动状态（可 Ctrl+Z 撤销）"
+    bl_label = "Unlock Physics"
+    bl_description = "Unmute all muted constraints on the selected armatures and re-enable the rigid body world, removing baked bone keyframes to fully return to driven motion (Ctrl+Z undoable)"
     bl_options = {'REGISTER', 'UNDO'}
 
     @classmethod
@@ -765,17 +769,17 @@ class ONTWOS_OT_unlock_physics(Operator):
                 keys += _remove_baked_keys(obj, bone_names, start, end)
         if rbw is not None:
             rbw.enabled = True
-        msg = f"已解除 {n} 个被静默的约束，物理世界已启用"
+        msg = f"Unmuted {n} constraints, rigid body world enabled"
         if keys:
-            msg += f"，清除烘焙关键帧 {keys} 个"
+            msg += f", removed {keys} baked keyframes"
         self.report({'INFO'}, msg)
         return {'FINISHED'}
 
 
 class ONTWOS_OT_preview_target(Operator):
     bl_idname = "ontwos.preview_target"
-    bl_label = "高亮目标骨骼"
-    bl_description = "在姿态模式下选中（高亮）当前目标设置将命中的骨骼，不做任何修改"
+    bl_label = "Highlight Target Bones"
+    bl_description = "Select (highlight) in Pose Mode the bones the current target setting would affect, without modifying anything"
 
     @classmethod
     def poll(cls, context):
@@ -786,7 +790,7 @@ class ONTWOS_OT_preview_target(Operator):
         if arm_obj is None or arm_obj.type != 'ARMATURE':
             armatures = [o for o in context.selected_objects if o.type == 'ARMATURE']
             if not armatures:
-                self.report({'WARNING'}, "请先选中骨架对象")
+                self.report({'WARNING'}, "Select an armature object first")
                 return {'CANCELLED'}
             arm_obj = armatures[0]
 
@@ -794,8 +798,8 @@ class ONTWOS_OT_preview_target(Operator):
         if not bone_names:
             self.report(
                 {'WARNING'},
-                "没有匹配到目标骨骼：请在姿态模式下选中骨骼（或勾选『包含子链』以覆盖整条链），"
-                "或将『目标骨骼』切换为『MMD 刚体跟踪骨』",
+                "No bones matched the target: select bones in Pose Mode (or enable 'Include Child Chains' to grab whole chains) "
+                "or switch 'Target Bones' to 'MMD Rigid-Track Bones'",
             )
             return {'CANCELLED'}
 
@@ -816,15 +820,15 @@ class ONTWOS_OT_preview_target(Operator):
 
         self.report(
             {'INFO'},
-            f"已在姿态模式高亮 {len(bone_names)} 个目标骨骼（未做任何修改）",
+            f"Highlighted {len(bone_names)} target bone(s) in Pose Mode (nothing modified)",
         )
         return {'FINISHED'}
 
 
 class ONTWOS_OT_preview(Operator):
     bl_idname = "ontwos.preview"
-    bl_label = "预览统计（不修改）"
-    bl_description = "无损统计将被抽稀的关键帧数量与命中曲线数"
+    bl_label = "Preview Stats (no changes)"
+    bl_description = "Count the keyframes that would be removed and the curves that would be affected, without modifying anything"
 
     @classmethod
     def poll(cls, context):
@@ -835,11 +839,11 @@ class ONTWOS_OT_preview(Operator):
         if s.use_stepped:
             n = len(_stepped_fcurves(context))
             if n == 0:
-                self.report({'WARNING'}, "没有命中的骨骼通道曲线（请先选中含动作的骨架）")
+                self.report({'WARNING'}, "No matching bone channel curves (select an armature with an action first)")
                 return {'CANCELLED'}
             self.report(
                 {'INFO'},
-                f"步进插值模式：将给 {n} 条骨骼通道曲线加一拍{s.step}步进（非破坏，可删修改器还原；未做任何修改）",
+                f"Stepped mode: will add an on-{s.step} step to {n} bone channel curves (non-destructive, remove modifiers to restore; nothing modified)",
             )
             return {'FINISHED'}
         s, step, phase, start, end, sel_bones = _resolve_filters(context)
@@ -853,18 +857,18 @@ class ONTWOS_OT_preview(Operator):
             if n:
                 curves_hit += 1
                 keys_removable += n
-        msg = f"命中 {curves_hit} 条曲线，将删除 {keys_removable} 个关键帧"
+        msg = f"Matched {curves_hit} curves, would remove {keys_removable} keyframes"
         skipped = _skip_summary(sk_b, sk_m, sk_d)
         if skipped:
-            msg += f"（跳过 {skipped}）"
-        self.report({'INFO'}, msg + "（未做任何修改）")
+            msg += f" (skipped: {skipped})"
+        self.report({'INFO'}, msg + " (nothing modified)")
         return {'FINISHED'}
 
 
 class ONTWOS_OT_apply(Operator):
     bl_idname = "ontwos.apply"
-    bl_label = "应用一拍N（抽稀+恒定）"
-    bl_description = "对选中物体/骨骼的烘焙关键帧抽稀并改为恒定插值，实现一拍N定格效果（可 Ctrl+Z 撤销）"
+    bl_label = "Apply On-N (decimate + hold)"
+    bl_description = "Decimate the baked keyframes of the selected objects/bones and set constant interpolation for the on-N hold (Ctrl+Z undoable)"
     bl_options = {'REGISTER', 'UNDO'}
 
     @classmethod
@@ -879,17 +883,17 @@ class ONTWOS_OT_apply(Operator):
                 _backup_action(adata.action)
         s = context.scene.ontwos
         if s.use_stepped:
-            # ---------- 步进插值模式（同曲线编辑器手动）：非破坏，目标骨骼通道统一步进 ----------
+            # ---------- 步进插值模式（同曲线编辑器手动）：非破坏，全部骨骼通道统一步进 ----------
             step = max(1, s.step)
             phase = s.phase % step
             start, end = sorted((s.frame_start, s.frame_end))
             touched = _apply_stepped(context, s, step, phase, start, end)
             if touched == 0:
-                self.report({'WARNING'}, "没有命中的骨骼通道曲线（请先选中含动作的骨架）")
+                self.report({'WARNING'}, "No matching bone channel curves (select an armature with an action first)")
                 return {'CANCELLED'}
             self.report(
                 {'INFO'},
-                f"步进插值已应用：{touched} 条骨骼通道曲线 一拍{step} 定格（非破坏，可删修改器还原）",
+                f"Stepped interpolation applied: on-{step} hold on {touched} bone channel curves (non-destructive, remove modifiers to restore)",
             )
             return {'FINISHED'}
         s, step, phase, start, end, sel_bones = _resolve_filters(context)
@@ -908,27 +912,27 @@ class ONTWOS_OT_apply(Operator):
             skipped = _skip_summary(sk_b, sk_m, sk_d)
             self.report(
                 {'WARNING'},
-                "没有命中任何可处理的曲线（请检查：选中的是骨架对象、范围正确、"
-                + ("MMD物理骨识别是否识别到" if s.use_mmd_physics else "『只处理密集』开关")
-                + (f"；跳过 {skipped}" if skipped else "") + "）",
+                "No processable curves matched (check: armature selected, range correct, "
+                + ("MMD physics detection enabled" if s.use_mmd_physics else "'Dense Baked Curves Only' switch")
+                + (f"; skipped: {skipped}" if skipped else "") + ")",
             )
             return {'CANCELLED'}
 
-        msg = f"已处理 {curves_touched} 条曲线，删除 {keys_removed} 个关键帧（一拍{step}）"
+        msg = f"Processed {curves_touched} curves, removed {keys_removed} keyframes (on-{step})"
         skipped = _skip_summary(sk_b, sk_m, sk_d)
         if skipped:
-            msg += f"（跳过 {skipped}）"
+            msg += f" (skipped: {skipped})"
         self.report({'INFO'}, msg)
         return {'FINISHED'}
 
 
 class ONTWOS_OT_remove_onetwos(Operator):
     bl_idname = "ontwos.remove_onetwos"
-    bl_label = "删除一拍N效果（恢复）"
+    bl_label = "Remove On-N (restore)"
     bl_description = (
-        "删除已添加的一拍N效果：优先用『应用一拍N』前备份的原始曲线精确恢复"
-        "（备份随文件保存，重开 Blender 也有效）；若无备份则用通用方式——移除步进插值修改器、"
-        "把范围内恒定插值改回平滑插值（只作用于目标骨骼，不碰手K骨骼）。"
+        "Remove the applied on-N effect: first tries exact restore from the backup taken before 'Apply On-N' "
+        "(backup is saved with the file and survives restarts); without a backup, falls back to a generic "
+        "method - remove stepped modifiers and smooth constant keys in range (target bones only, never hand-keyed bones)."
     )
     bl_options = {'REGISTER', 'UNDO'}
 
@@ -967,24 +971,24 @@ class ONTWOS_OT_remove_onetwos(Operator):
         if restored == 0 and smoothed == 0:
             self.report(
                 {'WARNING'},
-                "未找到可恢复的一拍N效果（请确认已选中含动作的骨架、范围正确；"
-                "若无备份则至少应有步进修改器或范围内的恒定插值曲线）",
+                "No on-N effect found to remove (confirm an armature with an action is selected and the range is correct; "
+                "without a backup there should at least be stepped modifiers or constant keys in range)",
             )
             return {'CANCELLED'}
 
         parts = []
         if restored:
-            parts.append(f"精确恢复 {restored} 个动作")
+            parts.append(f"exact restore of {restored} action(s)")
         if smoothed:
-            parts.append(f"通用去除：平滑 {smoothed} 条目标曲线（无备份）")
-        self.report({'INFO'}, "已删除一拍N效果，" + "；".join(parts))
+            parts.append(f"generic removal: smoothed {smoothed} target curve(s) (no backup)")
+        self.report({'INFO'}, "On-N effect removed: " + "; ".join(parts))
         return {'FINISHED'}
 
 
 class ONTWOS_OT_set_range(Operator):
     bl_idname = "ontwos.set_range"
-    bl_label = "范围取自场景帧区间"
-    bl_description = "把处理范围设置为当前场景的帧起止"
+    bl_label = "Use Scene Frame Range"
+    bl_description = "Set the processing range to the current scene frame range"
 
     @classmethod
     def poll(cls, context):
@@ -995,7 +999,7 @@ class ONTWOS_OT_set_range(Operator):
         context.scene.ontwos.frame_end = context.scene.frame_end
         self.report(
             {'INFO'},
-            f"范围已设为 [{context.scene.frame_start}, {context.scene.frame_end}]",
+            f"Range set to [{context.scene.frame_start}, {context.scene.frame_end}]",
         )
         return {'FINISHED'}
 
@@ -1005,11 +1009,11 @@ class ONTWOS_OT_set_range(Operator):
 # ---------------------------------------------------------------------------
 
 class ONTWOS_PT_panel(Panel):
-    bl_label = "一拍二重定时（通用版）"
+    bl_label = "On-Twos Retimer"
     bl_idname = "ONTWOS_PT_panel"
     bl_space_type = 'VIEW_3D'
     bl_region_type = 'UI'
-    bl_category = "一拍二"
+    bl_category = "On-Twos"
 
     def draw(self, context):
         s = context.scene.ontwos
@@ -1026,7 +1030,7 @@ class ONTWOS_PT_panel(Panel):
         # 第一步：驱动姿态 → 骨骼关键帧
         box = layout.box()
         col = box.column(align=True)
-        col.label(text="第一步 · 烘焙姿态→骨骼关键帧", icon="KEYFRAME_HLT")
+        col.label(text="Step 1 · Bake Poses → Bone Keyframes", icon="KEYFRAME_HLT")
         col.prop(s, "target_mode")
         col.prop(s, "follow_chain")
         col.operator("ontwos.preview_target", icon="RESTRICT_SELECT_OFF")
@@ -1038,17 +1042,19 @@ class ONTWOS_PT_panel(Panel):
         col.operator("ontwos.unlock_physics", icon="LOOP_BACK")
         tip = box.column(align=True)
         tip.scale_y = 0.85
-        tip.label(text="提示：勾选『两遍烘焙』= 保留阻尼观感且姿态确定", icon="INFO")
-        tip.label(text="（推荐，无跳回不重置问题）；默认烘焙=驱动+阻尼写入关键帧")
-        tip.label(text="并完全锁定；想再叠加一层活阻尼才勾选『保留阻尼』(非确定)。")
-        tip.label(text="勾选『包含子链』= 选中父骨自动覆盖整条子链；『高亮目标")
-        tip.label(text="骨骼』可预览将被烘焙的骨骼。『MMD 刚体跟踪骨』仅用于")
-        tip.label(text="MMD 模型（需 MMD Tools）。")
+        tip.label(text="Tip: 'Two-Pass Bake' keeps the soft damping look and stays", icon="INFO")
+        tip.label(text="deterministic (recommended, no jump-back reset issue); the")
+        tip.label(text="default bake writes driven motion + damping into keyframes")
+        tip.label(text="and fully locks; tick 'Keep Damping' only for an extra active")
+        tip.label(text="damping layer (non-deterministic). 'Include Child Chains'")
+        tip.label(text="grabs whole chains from a parent bone; the highlight button")
+        tip.label(text="shows exactly which bones would be baked. 'MMD Rigid-Track")
+        tip.label(text="Bones' is for MMD rigs (needs MMD Tools).")
 
         # 第二步：一拍N抽稀
         box = layout.box()
         col = box.column(align=True)
-        col.label(text="第二步 · 一拍N定格", icon="SNAP_ON")
+        col.label(text="Step 2 · On-N Hold", icon="SNAP_ON")
         col.prop(s, "step")
         col.prop(s, "phase")
         col.prop(s, "use_stepped")
@@ -1060,19 +1066,20 @@ class ONTWOS_PT_panel(Panel):
         col.operator("ontwos.remove_onetwos", icon="LOOP_BACK")
         tip = box.column(align=True)
         tip.scale_y = 0.85
-        tip.label(text="提示：『删除一拍N』= 删除已添加的一拍N效果：优先用备份精确恢复", icon="INFO")
-        tip.label(text="（备份随文件保存，重开Blender也有效）；无备份时通用去除——移")
-        tip.label(text="除步进修改器、把范围内恒定插值改回平滑，且只作用目标骨骼。")
-        tip.label(text="勾选『步进插值模式』= 与你手动全选通道→步进插值→步长尺寸 一致，")
-        tip.label(text="且只作用于目标骨骼（不碰躯干等手K骨骼），可删修改器还原。")
+        tip.label(text="Tip: 'Remove On-N' removes the applied effect: exact restore from", icon="INFO")
+        tip.label(text="backup when available (backup saves with the file and survives")
+        tip.label(text="restarts); otherwise generic removal - remove stepped modifiers,")
+        tip.label(text="smooth constant keys, target bones only. 'Stepped Mode'")
+        tip.label(text="matches doing it by hand (select all channels -> stepped -> size N)")
+        tip.label(text="and only touches target bones (never hand-keyed ones).")
 
         layout.separator()
         info = layout.box()
         info_col = info.column(align=True)
         info_col.scale_y = 0.85
-        info_col.label(text="流程：选中骨架 → ①烘焙姿态→关键帧", icon="INFO")
-        info_col.label(text="→ ②应用一拍N。误操作可 Ctrl+Z；")
-        info_col.label(text="想重做①：先『恢复驱动』再重新烘焙。")
+        info_col.label(text="Flow: select armature -> 1. bake poses -> keyframes", icon="INFO")
+        info_col.label(text="-> 2. apply on-N. Mistakes: Ctrl+Z; to redo step 1,")
+        info_col.label(text="'Unlock Physics' first, then re-bake.")
 
 
 # ---------------------------------------------------------------------------
